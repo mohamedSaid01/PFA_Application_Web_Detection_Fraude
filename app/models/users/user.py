@@ -17,3 +17,4 @@ class User(Base):
 
     # Relation utilisant le nom de classe en string pour éviter l'import circulaire
     reset_tokens = relationship("ResetToken", back_populates="user")
+    logs = relationship("Log", back_populates="user")

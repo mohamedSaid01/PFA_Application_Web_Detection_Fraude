@@ -12,6 +12,7 @@ from app.schemas.user import (
 from passlib.context import CryptContext
 from app.utils.jwt import create_access_token, get_current_user
 from app.config import ACCESS_TOKEN_EXPIRE_MINUTES
+from app.models.log import Log
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -48,37 +49,58 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
     
     return new_user
 
+
 @router.post("/signin")
 def signin(user: UserLogin, db: Session = Depends(get_db), response: Response = None):
-    # Vérifier si l'utilisateur existe
     db_user = db.query(User).filter(User.email == user.email).first()
     if not db_user:
+        # Enregistrer une tentative de connexion échouée
+        log = Log(
+            user_id=None,
+            action="login_failed",
+            description=f"Tentative de connexion échouée pour l'email {user.email}"
+        )
+        db.add(log)
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Email ou mot de passe incorrect"
         )
-    
-    # Vérifier le mot de passe
+
     if not pwd_context.verify(user.password, db_user.password):
+        log = Log(
+            user_id=db_user.id,
+            action="login_failed",
+            description="Mot de passe incorrect"
+        )
+        db.add(log)
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Email ou mot de passe incorrect"
         )
-    
-    # Générer le token JWT
+
     access_token = create_access_token(data={"sub": str(db_user.id)})
-    
-    # Stocker le token dans un cookie sécurisé
     response.set_cookie(
         key="access_token",
         value=f"Bearer {access_token}",
         httponly=True,
-        secure=False,   # Mettre à True en production avec HTTPS
+        secure=False,
         samesite="lax",
         max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60
     )
-    
+
+    # Enregistrer une connexion réussie
+    log = Log(
+        user_id=db_user.id,
+        action="login_success",
+        description="Connexion réussie"
+    )
+    db.add(log)
+    db.commit()
+
     return {"message": "Connexion réussie", "user_id": db_user.id}
+
 
 @router.get("/me", response_model=UserResponse)
 def get_current_user_profile(
@@ -116,6 +138,14 @@ def update_profile(
     """
     db_user = db.query(User).filter(User.id == user_id).first()
     if not db_user:
+        # Log failed attempt
+        log = Log(
+            user_id=None,
+            action="update_profile_failed",
+            description=f"Tentative de mise à jour du profil pour un utilisateur non trouvé (ID: {user_id})"
+        )
+        db.add(log)
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Utilisateur non trouvé"
@@ -125,6 +155,14 @@ def update_profile(
     if user_update.email and user_update.email != db_user.email:
         existing_user = db.query(User).filter(User.email == user_update.email).first()
         if existing_user:
+            # Log failed attempt due to email conflict
+            log = Log(
+                user_id=db_user.id,
+                action="update_profile_failed",
+                description=f"Tentative de mise à jour de l'email à {user_update.email} échouée : email déjà utilisé"
+            )
+            db.add(log)
+            db.commit()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Email déjà utilisé par un autre utilisateur"
@@ -132,15 +170,23 @@ def update_profile(
     
     # Mettre à jour tous les champs non-None de user_update
     update_data = user_update.model_dump(exclude_unset=True)
+    updated_fields = ", ".join(f"{key}={value}" for key, value in update_data.items())
     for field, value in update_data.items():
         setattr(db_user, field, value)
     
+    # Log successful profile update
+    log = Log(
+        user_id=db_user.id,
+        action="update_profile_success",
+        description=f"Profil mis à jour : {updated_fields}" if updated_fields else "Profil mis à jour (aucun champ modifié)"
+    )
+    db.add(log)
     db.commit()
     db.refresh(db_user)
     
     return db_user
 
-
+# routers/auth.py
 @router.put("/change-password")
 def change_password(
     password_data: ChangePasswordRequest,
@@ -150,22 +196,46 @@ def change_password(
     """
     Change le mot de passe de l'utilisateur
     """
-    # Vérifier que les nouveaux mots de passe correspondent
-    if password_data.new_password != password_data.confirm_new_password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Les nouveaux mots de passe ne correspondent pas"
-        )
-    
     db_user = db.query(User).filter(User.id == user_id).first()
     if not db_user:
+        # Log failed attempt
+        log = Log(
+            user_id=None,
+            action="change_password_failed",
+            description=f"Tentative de changement de mot de passe pour un utilisateur non trouvé (ID: {user_id})"
+        )
+        db.add(log)
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Utilisateur non trouvé"
         )
     
+    # Vérifier que les nouveaux mots de passe correspondent
+    if password_data.new_password != password_data.confirm_new_password:
+        # Log failed attempt
+        log = Log(
+            user_id=db_user.id,
+            action="change_password_failed",
+            description="Les nouveaux mots de passe ne correspondent pas"
+        )
+        db.add(log)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Les nouveaux mots de passe ne correspondent pas"
+        )
+    
     # Vérifier l'ancien mot de passe
     if not pwd_context.verify(password_data.old_password, db_user.password):
+        # Log failed attempt
+        log = Log(
+            user_id=db_user.id,
+            action="change_password_failed",
+            description="Ancien mot de passe incorrect"
+        )
+        db.add(log)
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Ancien mot de passe incorrect"
@@ -173,6 +243,14 @@ def change_password(
     
     # Vérifier que le nouveau mot de passe est différent
     if pwd_context.verify(password_data.new_password, db_user.password):
+        # Log failed attempt
+        log = Log(
+            user_id=db_user.id,
+            action="change_password_failed",
+            description="Le nouveau mot de passe est identique à l'ancien"
+        )
+        db.add(log)
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Le nouveau mot de passe doit être différent de l'ancien"
@@ -180,6 +258,14 @@ def change_password(
     
     # Mettre à jour le mot de passe
     db_user.password = pwd_context.hash(password_data.new_password)
+    
+    # Log successful password change
+    log = Log(
+        user_id=db_user.id,
+        action="change_password_success",
+        description="Mot de passe mis à jour avec succès"
+    )
+    db.add(log)
     db.commit()
     
     return {"message": "Mot de passe mis à jour avec succès"}
